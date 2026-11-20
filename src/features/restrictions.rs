@@ -13,16 +13,11 @@ pub struct Restriction {
 }
 
 pub struct RestrictionID {
-    pub id: u32,
+    pub id: NonZeroU32,
 }
 
 pub struct ZoneID {
     pub id: NonZeroU32,
-}
-
-pub enum RestrictionScope {
-    Zone(ZoneID),
-    Point,
 }
 
 bitflags::bitflags! {

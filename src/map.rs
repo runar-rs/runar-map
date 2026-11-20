@@ -1,17 +1,70 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::io::Write;
 
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
+use memmap2::MmapOptions;
+use uuid::Uuid;
 
 use crate::{
-    Feature, FeatureId, FeatureIndex, Geometry, Line, Node, NodeId, NodeIndex, Polygon,
     features::{LandUse, Road},
+    Feature, FeatureId, FeatureIndex, Geometry, Line, Node, NodeId, NodeIndex, Polygon,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ContainerID {
+    pub id: Uuid,
+}
+
+impl ContainerID {
+    pub fn new() -> Self {
+        Self { id: Uuid::new_v4() }
+    }
+
+    pub fn from_uuid(uuid: Uuid) -> Self {
+        Self { id: uuid }
+    }
+}
+
+pub struct MapContainerIndex {
+    /// Map of Map Element IDs to their index and the number of uses.
+    pub id_map: BTreeMap<Uuid, MapContainerIndexEntry>,
+}
+impl MapContainerIndex {
+    pub fn new() -> Self {
+        Self {
+            id_map: BTreeMap::new(),
+        }
+    }
+
+    pub fn increment_use(&mut self, id: Uuid) -> Result<()> {
+        if let Some(entry) = self.id_map.get_mut(&id) {
+            entry.uses += 1;
+            Ok(())
+        } else {
+            // Return error, as element isn't in the file.
+            bail!("Element with ID {} not found in map container index", id);
+        }
+    }
+}
+
+pub struct MapContainerIndexEntry {
+    pub container_id: ContainerID,
+    pub uses: u16,
+}
+
 pub struct Map {
+    container_offsets: BTreeMap<ContainerID, u64>,
+    /// Index of map containers that belong to this map.
+    item_index: MapContainerIndex,
+
+    version: semver::Version,
+    /// Path to the map file, if it was loaded from a file.
+    path: Option<std::path::PathBuf>,
+
     nodes: Vec<Node>,
     roads: Vec<Feature<Road>>,
     land_uses: Vec<Feature<LandUse>>,
-    
+
     /// Maps node IDs to their index in the `nodes` vector.
     node_ids: HashMap<NodeId, NodeIndex>,
 
@@ -26,6 +79,7 @@ pub enum FeatureLocation {
 }
 
 impl Map {
+    /// Creates a new empty map.
     pub fn new() -> Self {
         Self::default()
     }
@@ -79,14 +133,17 @@ impl Map {
         self.feature_ids.get(&id).copied()
     }
 
+    /// Check if all nodes referenced by the given line exist in the map.
     fn validate_line(&self, line: &Line) -> Result<()> {
         self.validate_nodes(line.nodes.iter().copied())
     }
 
+    /// Check if all nodes referenced by the given polygon exist in the map.
     fn validate_polygon(&self, polygon: &Polygon) -> Result<()> {
         self.validate_nodes(polygon.rings.iter().flat_map(|ring| ring.iter().copied()))
     }
 
+    /// Check if all nodes referenced by the given iterator exist in the map.
     fn validate_nodes(&self, indexes: impl Iterator<Item = NodeIndex>) -> Result<()> {
         for index in indexes {
             if self.node(index).is_none() {
@@ -106,11 +163,139 @@ impl Map {
 impl Default for Map {
     fn default() -> Self {
         Self {
+            container_offsets: BTreeMap::new(),
+            item_index: MapContainerIndex::new(),
+            version: semver::Version::parse(env!("CARGO_PKG_VERSION"))
+                .expect("invalid version number"),
+            path: None,
             nodes: Vec::new(),
             roads: Vec::new(),
             land_uses: Vec::new(),
             node_ids: HashMap::new(),
             feature_ids: HashMap::new(),
         }
+    }
+}
+
+pub const MAP_MAGIC: &[u8; 8] = b"RUNARMAP";
+
+/// Memory operations for Map.
+impl Map {
+    /// Goes through the map and unloads any data that hasn't recently been used.
+    pub fn trim(&mut self) {
+        todo!();
+    }
+
+    pub fn load(path: &std::path::Path) -> Result<Self> {
+        let file = std::fs::File::open(path)?;
+        // Read the first 28 bytes of the file to check the magic number and version. This reads
+        // until number_of_containers, which is the last field which offset is known at compile
+        // time.
+        let header = unsafe { MmapOptions::new().len(28).map(&file)? };
+        if !header.starts_with(MAP_MAGIC) {
+            bail!("invalid map file: missing magic number");
+        }
+
+        // Read the version number from the file and check if it is compatible with the current version.
+        let version =
+            semver::Version::parse(env!("CARGO_PKG_VERSION")).expect("invalid version number");
+        let major = u32::from_le_bytes(header[8..12].try_into().unwrap()) as u64;
+        let minor = u32::from_le_bytes(header[12..16].try_into().unwrap()) as u64;
+        let patch = u32::from_le_bytes(header[16..20].try_into().unwrap()) as u64;
+        let file_version = semver::Version::new(major, minor, patch);
+        if file_version.major != version.major || file_version.minor != version.minor {
+            bail!(
+                "Incompatible map version: {}.{}.{} (expected {}.{}.{})",
+                major,
+                minor,
+                patch,
+                version.major,
+                version.minor,
+                version.patch
+            );
+        }
+
+        // Start populating the map from the file.
+        let mut map = Self::default();
+        map.version = file_version;
+        map.path = Some(path.to_path_buf());
+
+        let number_of_containers = u32::from_le_bytes(header[20..24].try_into().unwrap());
+
+        if number_of_containers > 0 {
+            let container_header = unsafe {
+                MmapOptions::new()
+                    .offset(28)
+                    .len((number_of_containers as usize) * 24)
+                    .map(&file)?
+            };
+
+            for i in 0..number_of_containers as usize {
+                let container_uuid = ContainerID::from_uuid(Uuid::from_bytes_le(
+                    container_header[(24 * i)..(24 * i + 16)]
+                        .try_into()
+                        .unwrap(),
+                ));
+                let container_offset = u64::from_le_bytes(
+                    container_header[(24 * i + 16)..(24 * i + 24)]
+                        .try_into()
+                        .unwrap(),
+                );
+                map.container_offsets
+                    .insert(container_uuid, container_offset);
+            }
+        }
+
+        Ok(map)
+    }
+
+    pub fn save(&self) -> Result<()> {
+        if let Some(path) = &self.path {
+            self.save_to_path(path)
+        } else {
+            bail!("Map contains no path, so it cannot be saved. Use `save_to_path` instead.");
+        }
+    }
+
+    pub fn save_to_path(&self, path: &std::path::Path) -> Result<()> {
+        let number_of_containers = u64::try_from(self.container_offsets.len())
+            .map_err(|_| anyhow::anyhow!("map contains too many containers"))?;
+        let major = u32::try_from(self.version.major)
+            .map_err(|_| anyhow::anyhow!("map major version does not fit in the file format"))?;
+        let minor = u32::try_from(self.version.minor)
+            .map_err(|_| anyhow::anyhow!("map minor version does not fit in the file format"))?;
+        let patch = u32::try_from(self.version.patch)
+            .map_err(|_| anyhow::anyhow!("map patch version does not fit in the file format"))?;
+
+        let mut file = std::fs::File::create(path)?;
+        file.write_all(MAP_MAGIC)?;
+        file.write_all(&major.to_le_bytes())?;
+        file.write_all(&minor.to_le_bytes())?;
+        file.write_all(&patch.to_le_bytes())?;
+        file.write_all(&number_of_containers.to_le_bytes())?;
+
+        for (container_id, offset) in &self.container_offsets {
+            file.write_all(&container_id.id.to_bytes_le())?;
+            file.write_all(&offset.to_le_bytes())?;
+        }
+
+        file.flush()?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Map;
+
+    #[test]
+    fn saved_empty_map_can_be_loaded() {
+        let path = std::env::temp_dir().join(format!("runar-map-{}.map", uuid::Uuid::new_v4()));
+
+        Map::new().save_to_path(&path).unwrap();
+        let loaded = Map::load(&path).unwrap();
+
+        assert!(loaded.container_offsets.is_empty());
+        std::fs::remove_file(path).unwrap();
     }
 }

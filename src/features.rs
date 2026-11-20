@@ -1,13 +1,32 @@
-use crate::{LocalizedString, Property};
+use crate::{LocalizedString, Property, features::restrictions::{RestrictionID, ZoneID}};
 use runar_units::types::l_1::Length;
 
 pub mod restrictions;
 
 pub struct Road {
+    /// Surface material of the road.
     pub surface: RoadSurface,
+    /// Condition of the road surface.
     pub surface_condition: RoadSurfaceCondition,
+    /// Name of the road.
+    /// 
+    /// # Example
+    /// - "Main Street"
+    /// - "Barrington Road"
+    /// - "Dexter Avenue"
     pub name: LocalizedString,
-    pub refs: Vec<LocalizedString>,
+
+    /// References to the road.
+    ///
+    /// # Example
+    /// - "A1"
+    /// - "I95"
+    /// - "M25"
+    /// - "E20"
+    pub refs: Vec<String>,
+    /// Lanes of the road.
+    pub lanes: Vec<Lane>,
+    pub zones: Vec<ZoneID>,
 }
 impl Property for Road {}
 
@@ -16,6 +35,8 @@ pub struct Lane {
     pub direction: LaneDirection,
     /// The width of the lane in meters.
     pub width: Option<Length<f64, runar_units::types::l_1::Meter>>,
+    /// Local lane specific restriction.
+    pub restriction: Option<RestrictionID>,
 }
 
 pub enum LaneDirection {
