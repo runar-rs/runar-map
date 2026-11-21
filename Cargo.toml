@@ -8,8 +8,10 @@ anyhow = "1.0.103"
 bitflags = { version = "2.13.2", features = ["serde"] }
 language-tags = "0.3.2"
 memmap2 = "0.9.12"
+num_enum = "0.7.6"
 petgraph = "0.8.3"
 runar-units = { git = "https://github.com/runar-rs/runar-units.git", version = "0.4.1" }
 semver = "1.0.28"
 serde = "1.0.229"
+tokio = { version = "1.54.1", features = ["sync"] }
 uuid = { version = "1.23.3", features = ["v4"] }

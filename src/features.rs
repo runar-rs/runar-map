@@ -1,4 +1,7 @@
-use crate::{LocalizedString, Property, features::restrictions::{RestrictionID, ZoneID}};
+use crate::{
+    LocalizedString, Property,
+    features::restrictions::{RestrictionID, ZoneID},
+};
 use runar_units::types::l_1::Length;
 
 pub mod restrictions;
@@ -9,7 +12,7 @@ pub struct Road {
     /// Condition of the road surface.
     pub surface_condition: RoadSurfaceCondition,
     /// Name of the road.
-    /// 
+    ///
     /// # Example
     /// - "Main Street"
     /// - "Barrington Road"

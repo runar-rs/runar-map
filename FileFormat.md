@@ -12,6 +12,10 @@
 MapContainerIndex
 8 Bytes Number of Items
 [
-    8 Bytes Item UUID
-    8 Bytes Container Index
+    16 Bytes Item UUID
+    16 Bytes Container UUID
+    8 Bytes Item Offset
+    2 Bytes Item Type
 ]
+
+

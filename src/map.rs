@@ -1,14 +1,26 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::io::Write;
+use std::num::NonZeroU64;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use memmap2::MmapOptions;
+use num_enum::{IntoPrimitive, TryFromPrimitive};
+use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::{
-    features::{LandUse, Road},
     Feature, FeatureId, FeatureIndex, Geometry, Line, Node, NodeId, NodeIndex, Polygon,
+    features::{LandUse, Road},
 };
+
+#[repr(u16)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, TryFromPrimitive, IntoPrimitive)]
+pub enum ItemType {
+    Node,
+    Road,
+    LandUse,
+    Restriction,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ContainerID {
@@ -49,7 +61,10 @@ impl MapContainerIndex {
 
 pub struct MapContainerIndexEntry {
     pub container_id: ContainerID,
-    pub uses: u16,
+    pub uses: u32,
+    pub offset: Option<NonZeroU64>,
+    pub item_type: ItemType,
+    pub is_loaded: bool,
 }
 
 pub struct Map {
@@ -61,15 +76,15 @@ pub struct Map {
     /// Path to the map file, if it was loaded from a file.
     path: Option<std::path::PathBuf>,
 
-    nodes: Vec<Node>,
-    roads: Vec<Feature<Road>>,
-    land_uses: Vec<Feature<LandUse>>,
+    nodes: RwLock<Vec<Option<Node>>>,
+    roads: RwLock<Vec<Feature<Road>>>,
+    land_uses: RwLock<Vec<Feature<LandUse>>>,
 
     /// Maps node IDs to their index in the `nodes` vector.
-    node_ids: HashMap<NodeId, NodeIndex>,
+    node_ids: RwLock<BTreeMap<NodeId, NodeIndex>>,
 
     /// Maps feature IDs to their location in the map.
-    feature_ids: HashMap<FeatureId, FeatureLocation>,
+    feature_ids: RwLock<BTreeMap<FeatureId, FeatureLocation>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,69 +99,90 @@ impl Map {
         Self::default()
     }
 
-    pub fn add_node(&mut self, node: Node) -> NodeIndex {
+    pub async fn add_node(&self, node: Node) -> NodeIndex {
+        let mut nodes = self.nodes.write().await;
         let index = NodeIndex(
-            u32::try_from(self.nodes.len()).expect("a map cannot contain more than u32::MAX nodes"),
+            u32::try_from(nodes.len()).expect("a map cannot contain more than u32::MAX nodes"),
         );
-        self.node_ids.insert(node.id(), index);
-        self.nodes.push(node);
+        self.node_ids.write().await.insert(node.id(), index);
+        nodes.push(Some(node));
         index
     }
 
-    pub fn node(&self, index: NodeIndex) -> Option<&Node> {
-        self.nodes.get(index.0 as usize)
+    /// Returns a copy of the node at the given index, or `None` if it is not loaded.
+    pub async fn node(&self, index: NodeIndex) -> Option<Node> {
+        self.nodes
+            .read()
+            .await
+            .get(index.0 as usize)
+            .and_then(Option::as_ref)
+            .cloned()
     }
 
-    pub fn node_index(&self, id: NodeId) -> Option<NodeIndex> {
-        self.node_ids.get(&id).copied()
+    pub async fn node_index(&self, id: NodeId) -> Option<NodeIndex> {
+        self.node_ids.read().await.get(&id).copied()
     }
 
-    pub fn add_road(&mut self, road: Feature<Road>) -> Result<FeatureIndex> {
+    pub async fn add_road(&self, road: Feature<Road>) -> Result<FeatureIndex> {
         let geometry = match &road.geometry {
             Geometry::Line(line) => line,
             _ => bail!("a road feature must have line geometry"),
         };
-        self.validate_line(geometry)?;
+        self.validate_line(geometry).await?;
 
-        let index = self.next_feature_index(self.roads.len())?;
+        let mut roads = self.roads.write().await;
+        let index = self.next_feature_index(roads.len())?;
         let id = road.id();
-        self.roads.push(road);
-        self.feature_ids.insert(id, FeatureLocation::Road(index));
+        roads.push(road);
+        self.feature_ids
+            .write()
+            .await
+            .insert(id, FeatureLocation::Road(index));
         Ok(index)
     }
 
-    pub fn add_land_use(&mut self, land_use: Feature<LandUse>) -> Result<FeatureIndex> {
+    pub async fn add_land_use(&self, land_use: Feature<LandUse>) -> Result<FeatureIndex> {
         let geometry = match &land_use.geometry {
             Geometry::Polygon(polygon) => polygon,
             _ => bail!("a land-use feature must have polygon geometry"),
         };
-        self.validate_polygon(geometry)?;
+        self.validate_polygon(geometry).await?;
 
-        let index = self.next_feature_index(self.land_uses.len())?;
+        let mut land_uses = self.land_uses.write().await;
+        let index = self.next_feature_index(land_uses.len())?;
         let id = land_use.id();
-        self.land_uses.push(land_use);
-        self.feature_ids.insert(id, FeatureLocation::LandUse(index));
+        land_uses.push(land_use);
+        self.feature_ids
+            .write()
+            .await
+            .insert(id, FeatureLocation::LandUse(index));
         Ok(index)
     }
 
-    pub fn feature_location(&self, id: FeatureId) -> Option<FeatureLocation> {
-        self.feature_ids.get(&id).copied()
+    pub async fn feature_location(&self, id: FeatureId) -> Option<FeatureLocation> {
+        self.feature_ids.read().await.get(&id).copied()
     }
 
     /// Check if all nodes referenced by the given line exist in the map.
-    fn validate_line(&self, line: &Line) -> Result<()> {
-        self.validate_nodes(line.nodes.iter().copied())
+    async fn validate_line(&self, line: &Line) -> Result<()> {
+        self.validate_nodes(line.nodes.iter().copied()).await
     }
 
     /// Check if all nodes referenced by the given polygon exist in the map.
-    fn validate_polygon(&self, polygon: &Polygon) -> Result<()> {
+    async fn validate_polygon(&self, polygon: &Polygon) -> Result<()> {
         self.validate_nodes(polygon.rings.iter().flat_map(|ring| ring.iter().copied()))
+            .await
     }
 
     /// Check if all nodes referenced by the given iterator exist in the map.
-    fn validate_nodes(&self, indexes: impl Iterator<Item = NodeIndex>) -> Result<()> {
+    async fn validate_nodes(&self, indexes: impl Iterator<Item = NodeIndex>) -> Result<()> {
+        let nodes = self.nodes.read().await;
         for index in indexes {
-            if self.node(index).is_none() {
+            if nodes
+                .get(index.0 as usize)
+                .and_then(Option::as_ref)
+                .is_none()
+            {
                 bail!("geometry references missing node index {}", index.0);
             }
         }
@@ -168,11 +204,11 @@ impl Default for Map {
             version: semver::Version::parse(env!("CARGO_PKG_VERSION"))
                 .expect("invalid version number"),
             path: None,
-            nodes: Vec::new(),
-            roads: Vec::new(),
-            land_uses: Vec::new(),
-            node_ids: HashMap::new(),
-            feature_ids: HashMap::new(),
+            nodes: RwLock::new(Vec::new()),
+            roads: RwLock::new(Vec::new()),
+            land_uses: RwLock::new(Vec::new()),
+            node_ids: RwLock::new(BTreeMap::new()),
+            feature_ids: RwLock::new(BTreeMap::new()),
         }
     }
 }
@@ -182,10 +218,34 @@ pub const MAP_MAGIC: &[u8; 8] = b"RUNARMAP";
 /// Memory operations for Map.
 impl Map {
     /// Goes through the map and unloads any data that hasn't recently been used.
-    pub fn trim(&mut self) {
-        todo!();
+    pub async fn trim(&self) {
+        let unused_node_ids: Vec<_> = self
+            .item_index
+            .id_map
+            .iter()
+            .filter(|(_, entry)| {
+                entry.item_type == ItemType::Node && entry.is_loaded && entry.uses == 0
+            })
+            .map(|(id, _)| NodeId(*id))
+            .collect();
+        // This waits for the write lock on nodes and node_ids, so it should be done after the read
+        // locks on the map items have been released.
+        let mut nodes = self.nodes.write().await;
+        let mut node_ids = self.node_ids.write().await;
+        for node_id in unused_node_ids {
+            if let Some(index) = node_ids.remove(&node_id) {
+                if let Some(node) = nodes.get_mut(index.0 as usize) {
+                    *node = None;
+                }
+            }
+        }
+        // Compact the nodes vector to remove any None entries.
+        nodes.retain(|node| node.is_some());
     }
-
+    /// Loads a map from the given path. This includes loading the map's index and other metadata,
+    /// but not the actual map data.
+    /// 
+    /// The file format is a compacted format, that only includes a snapshot of the map.
     pub fn load(path: &std::path::Path) -> Result<Self> {
         let file = std::fs::File::open(path)?;
         // Read the first 28 bytes of the file to check the magic number and version. This reads
@@ -220,8 +280,10 @@ impl Map {
         map.version = file_version;
         map.path = Some(path.to_path_buf());
 
+        // Read the number of containers from the file.
         let number_of_containers = u32::from_le_bytes(header[20..24].try_into().unwrap());
 
+        // Read the container offsets from the file. Each container offset is 24 bytes long.
         if number_of_containers > 0 {
             let container_header = unsafe {
                 MmapOptions::new()
@@ -243,6 +305,48 @@ impl Map {
                 );
                 map.container_offsets
                     .insert(container_uuid, container_offset);
+            }
+        }
+
+        let item_header = unsafe {
+            MmapOptions::new()
+                .offset(28 + (number_of_containers as u64) * 24)
+                .len(8)
+                .map(&file)?
+        };
+
+        let number_of_items = u64::from_le_bytes(item_header[0..8].try_into().unwrap());
+
+        if number_of_items > 0 {
+            let item_map = unsafe {
+                MmapOptions::new()
+                    .offset(28 + (number_of_containers as u64) * 24 + 8)
+                    .len((number_of_items as usize) * 42)
+                    .map(&file)?
+            };
+
+            for i in 0..number_of_items as usize {
+                let item_id =
+                    Uuid::from_bytes_le(item_map[(42 * i)..(42 * i + 16)].try_into().unwrap());
+
+                let container_id = ContainerID::from_uuid(Uuid::from_bytes_le(
+                    item_map[(42 * i + 16)..(42 * i + 32)].try_into().unwrap(),
+                ));
+
+                map.item_index.id_map.insert(
+                    item_id,
+                    MapContainerIndexEntry {
+                        container_id,
+                        uses: 0,
+                        offset: NonZeroU64::new(u64::from_le_bytes(
+                            item_map[(42 * i + 32)..(42 * i + 40)].try_into().unwrap(),
+                        )),
+                        item_type: ItemType::try_from(u16::from_le_bytes(
+                            item_map[42 * i + 40..42 * i + 42].try_into().unwrap(),
+                        ))?,
+                        is_loaded: false,
+                    },
+                );
             }
         }
 
@@ -277,6 +381,19 @@ impl Map {
         for (container_id, offset) in &self.container_offsets {
             file.write_all(&container_id.id.to_bytes_le())?;
             file.write_all(&offset.to_le_bytes())?;
+        }
+
+        // Write the number of items in the map.
+        let number_of_items = u64::try_from(self.item_index.id_map.len())
+            .map_err(|_| anyhow::anyhow!("map contains too many items"))?;
+        file.write_all(&number_of_items.to_le_bytes())?;
+
+        // Write the item index to the file.
+        for (item_id, entry) in &self.item_index.id_map {
+            file.write_all(&item_id.to_bytes_le())?;
+            file.write_all(&entry.container_id.id.to_bytes_le())?;
+            file.write_all(&entry.offset.map_or(0, |offset| offset.get()).to_le_bytes())?;
+            file.write_all(&(entry.item_type as u16).to_le_bytes())?;
         }
 
         file.flush()?;

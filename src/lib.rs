@@ -28,7 +28,7 @@ impl<T: Property> Feature<T> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FeatureId(pub Uuid);
 
 pub enum Geometry {
@@ -53,6 +53,7 @@ pub struct LocalizedString {
 }
 
 /// Represents a single point on the map.
+#[derive(Clone)]
 pub struct Node {
     /// Id of the node.
     ///
@@ -96,7 +97,7 @@ impl Node {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeId(pub Uuid);
 
 /// Dense, map-local index of a node.
