@@ -13,5 +13,5 @@ petgraph = "0.8.3"
 runar-units = { git = "https://github.com/runar-rs/runar-units.git", version = "0.4.1" }
 semver = "1.0.28"
 serde = "1.0.229"
-tokio = { version = "1.54.1", features = ["sync"] }
+tokio = { version = "1.54.1", features = ["full", "sync"] }
 uuid = { version = "1.23.3", features = ["v4"] }

@@ -403,7 +403,11 @@ impl Map {
 
 #[cfg(test)]
 mod tests {
-    use super::Map;
+    use std::num::NonZeroU64;
+
+    use super::{
+        ContainerID, ItemType, Map, MapContainerIndexEntry,
+    };
 
     #[test]
     fn saved_empty_map_can_be_loaded() {
@@ -413,6 +417,40 @@ mod tests {
         let loaded = Map::load(&path).unwrap();
 
         assert!(loaded.container_offsets.is_empty());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn saved_non_empty_map_can_be_loaded() {
+        let path = std::env::temp_dir().join(format!("runar-map-{}.map", uuid::Uuid::new_v4()));
+        let mut map = Map::new();
+        let container_id = ContainerID::new();
+        let item_id = uuid::Uuid::new_v4();
+
+        map.container_offsets
+            .insert(container_id, 28 + 24);
+        map.item_index.id_map.insert(
+            item_id,
+            MapContainerIndexEntry {
+                container_id,
+                uses: 1,
+                offset: NonZeroU64::new(52),
+                item_type: ItemType::Node,
+                is_loaded: true,
+            },
+        );
+
+        map.save_to_path(&path).unwrap();
+        let loaded = Map::load(&path).unwrap();
+
+        assert_eq!(loaded.container_offsets.len(), 1);
+        assert_eq!(loaded.item_index.id_map.len(), 1);
+        let entry = loaded.item_index.id_map.get(&item_id).unwrap();
+        assert_eq!(entry.container_id, container_id);
+        assert_eq!(entry.uses, 0);
+        assert_eq!(entry.offset, NonZeroU64::new(52));
+        assert_eq!(entry.item_type, ItemType::Node);
+        assert!(!entry.is_loaded);
         std::fs::remove_file(path).unwrap();
     }
 }
